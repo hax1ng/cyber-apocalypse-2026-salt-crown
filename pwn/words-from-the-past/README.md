@@ -18,7 +18,7 @@ tries the eight possible values on fresh connections.
 The exploit was run successfully against the live challenge and obtained:
 
 ```text
-HTB{f1v3_byt3s_0f_pr3c1s10n_t0 rul3_th3m_4ll_11aa4118ee4cd2c62d41e23868aea1e5}
+HTB{f1v3_byt3s_0f_pr3c1s10n_t0_rul3_th3m_4ll_11aa4118ee4cd2c62d41e23868aea1e5}
 ```
 
 ---
@@ -351,7 +351,7 @@ guess `getpid() & 7 == 0` matched:
 [+] shell obtained with PID low bits 0
 [*] Switching to interactive mode
 
-HTB{f1v3_byt3s_0f_pr3c1s10n_t0 rul3_th3m_4ll_11aa4118ee4cd2c62d41e23868aea1e5}
+HTB{f1v3_byt3s_0f_pr3c1s10n_t0_rul3_th3m_4ll_11aa4118ee4cd2c62d41e23868aea1e5}
 ```
 
 The retries are expected rather than a sign that the exploit is broken. Every

@@ -73,7 +73,7 @@ they explain not just *what* was done, but *why* each step works.
 | Challenge | Flag | Writeup |
 |---|---|---|
 | Heavy is the Krown | `HTB{h34vy_15_th3_kr0wn_7h4t_w34r5_th3_w31gh7_0f_4uth0r17y}` | [writeup](pwn/heavy-is-the-krown/) |
-| Words from the Past | `HTB{f1v3_byt3s_0f_pr3c1s10n_t0 rul3_th3m_4ll_11aa4118ee4cd2c62d41e23868aea1e5}` | [writeup](pwn/words-from-the-past/) |
+| Words from the Past | `HTB{f1v3_byt3s_0f_pr3c1s10n_t0_rul3_th3m_4ll_11aa4118ee4cd2c62d41e23868aea1e5}` | [writeup](pwn/words-from-the-past/) |
 
 *Heavy is the Krown — a custom Linux kernel driver (`/dev/krown`) with a memory-corruption bug, escalated to root to read the flag. Words from the Past — chain two stages of *exactly five bytes* of shellcode (the first must start with a `call`) into a working exploit.*
 
