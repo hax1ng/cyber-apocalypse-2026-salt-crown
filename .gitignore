@@ -1,0 +1,40 @@
+# Large / binary challenge artifacts — not committed (see writeups to reproduce)
+*.apk
+*.so
+*.dll
+*.dex
+*.pck
+*.img
+*.elf
+*.dmp
+*.pcap
+*.pcapng
+*.7z
+*.zip
+*.gz
+*.tar
+*.pt
+*.bin
+*.hash
+*.stripped
+*.musl
+
+# Compiled solve binaries
+solve_fast
+exploit
+exploit.*
+!exploit.c
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/

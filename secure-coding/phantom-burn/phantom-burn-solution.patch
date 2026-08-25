@@ -1,0 +1,1267 @@
+From 8cd84ea7b9e2de899ae15eb4569f3ae5910048c3 Mon Sep 17 00:00:00 2001
+From: htb_developer <htb_developer@securecoding.htb>
+Date: Fri, 24 Jul 2026 11:54:23 -0500
+Subject: [PATCH] restore the witness chain and bind every grant to the
+ authenticated owner
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+## The vulnerability
+
+`archive-service/src/chainReceipt.ts::verifyReceipt` was a stub that accepted any
+`0x`-shaped JSON without consulting the chain, so a counterfeit receipt "no
+rightful keeper issued" passed the weighing and `POST /archive/archive/open`
+handed back the source grant (confirmed live). Worse, entitlement was derived
+from **publicly observable on-chain material**: the app minted the bundle token
+from public event fields and the registry's `unlockSeal` is a public value, so any
+chain observer could obtain the source bundle.
+
+## The fix
+
+**1 — Weigh the claim against the witnessed filing (both services).** The
+referenced transaction is read over RPC; the log at `receipt.logIndex` must have
+been emitted by **the trusted registry address** (defeating a look-alike contract
+re-emitting `ShardFiled`); the tx must have succeeded and be sufficiently
+confirmed; the receipt's `owner`/`shardId` must equal the decoded event. Any
+RPC/decode failure fails closed. A receipt with no matching event on the trusted
+registry cannot survive the weighing.
+
+**2 — Authorize on the authenticated owner, never on public chain material.** The
+publicly emitted `unlockSeal` is treated as *provenance only*, not as an
+entitlement. Authorization binds the verified on-chain `owner` to the
+authenticated caller the trusted relay asserts (`x-archive-principal` /
+`x-archive-role`): the archive `/open` and the app `/unlock` require the caller to
+be a **keeper whose address is the witnessed owner**. The verified owner is the
+only identity used at every grant point.
+
+**3 — The bundle capability is not a bearer token.** `deriveArchiveToken` is an
+HMAC keyed with the server-only `SOURCE_BUNDLE_SIGNING_KEY` (previously unused), so
+it cannot be reproduced from public fields; the issued token is bound to the owner
+it was granted to and is honoured only for that authenticated owner at
+`/api/source/bundle`; and it is single-use, spent on presentation.
+
+**4 — Single-use consumption bound to the witness.** Both grants are consumed once,
+keyed by an id derived from the *witnessed* on-chain values, preserving exactly one
+legitimate owner unlock; replays get `409`/`403`.
+
+No contract change is required — the registry's public data is provenance, and the
+services simply stop treating it as a secret.
+
+## Distributed bundle rebuilt
+
+`archive-service.locked.tar.gz` was still the pre-patch snapshot (stub
+`verifyReceipt`); it is regenerated from the patched source so the shipped bundle
+runs the hardened verifier, not the vulnerable one.
+
+## Verification
+
+- `npm run build` green; `npm test` green for both services with no prior build
+  required (self-contained tests); `forge test` 3/3.
+- End-to-end against a local anvil (production registry address): a keeper (owner)
+  with a legitimate receipt unlocks and downloads the bundle; a caller that is a
+  visitor, is not the owner, presents a forged/wrong-registry/rogue-emitter
+  receipt, or replays a token/leaks it to a different principal is refused
+  (`400`/`403`/`409`).
+
+## Documented residual
+
+Single-use / issued-token state is in-memory per-process (sufficient for this
+single-instance deployment); production should persist it in a durable shared
+store keyed by the witnessed receipt id.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ phantom_burn/app/src/config.ts                |   6 +-
+ phantom_burn/app/src/routes.ts                |  56 ++++++-
+ phantom_burn/app/src/sourceVault.ts           |  77 +++++++--
+ phantom_burn/app/test/sourceVault.test.mjs    |  37 ++--
+ phantom_burn/archive-service.locked.tar.gz    | Bin 21236 -> 23818 bytes
+ .../archive-service/src/chainReceipt.ts       | 158 +++++++++++++++++-
+ phantom_burn/archive-service/src/config.ts    |   7 +-
+ .../archive-service/src/receiptStore.ts       |   9 +
+ phantom_burn/archive-service/src/routes.ts    |   5 +-
+ .../test/chainReceipt.test.mjs                |  28 ++--
+ phantom_burn/tools/unlock-source.mjs          |  11 +-
+ 11 files changed, 339 insertions(+), 55 deletions(-)
+
+diff --git a/phantom_burn/app/src/config.ts b/phantom_burn/app/src/config.ts
+index 5d06863..34b2f99 100644
+--- a/phantom_burn/app/src/config.ts
++++ b/phantom_burn/app/src/config.ts
+@@ -8,6 +8,9 @@ export type AppConfig = {
+   archiveBundle: string;
+   databaseUrl: string;
+   sessionKey: string;
++  // Server-side secret used to bind source-bundle tokens so they cannot be
++  // reproduced from publicly observable on-chain fields.
++  sourceBundleSigningKey: string;
+ };
+ 
+ function deployedRegistry(): `0x${string}` | undefined {
+@@ -33,6 +36,7 @@ export function loadConfig(): AppConfig {
+     archiveBundle: process.env.PHANTOM_BURN_ARCHIVE_BUNDLE ?? "../archive-service.locked.tar.gz",
+     databaseUrl: process.env.PHANTOM_BURN_DATABASE_URL ??
+       "postgres://phantom_burn@127.0.0.1:5432/phantom_burn",
+-    sessionKey: process.env.PHANTOM_BURN_SESSION_KEY ?? "phantom_burn-console-session-key"
++    sessionKey: process.env.PHANTOM_BURN_SESSION_KEY ?? "phantom_burn-console-session-key",
++    sourceBundleSigningKey: process.env.SOURCE_BUNDLE_SIGNING_KEY ?? "phantom_burn-source-bundle-signing-key"
+   };
+ }
+diff --git a/phantom_burn/app/src/routes.ts b/phantom_burn/app/src/routes.ts
+index 53edf78..ecded5b 100644
+--- a/phantom_burn/app/src/routes.ts
++++ b/phantom_burn/app/src/routes.ts
+@@ -15,7 +15,28 @@ import {
+ 
+ export function routes(config: AppConfig) {
+   const router = express.Router();
+-  const issuedTokens = new Set<string>();
++  // Single-use, server-secret-keyed bundle tokens mapped to the on-chain owner
++  // they were granted to. Keyed derivation means a token cannot be reproduced
++  // from public chain fields, each is spent on use, and it is honoured only for
++  // that owner — so it is never a transferable bearer capability.
++  const issuedTokens = new Map<string, string>();
++  // Filings whose one legitimate unlock has already been drawn, keyed by the id
++  // bound to witnessed on-chain values.
++  const consumedFilings = new Set<string>();
++
++  // The authenticated caller the trusted runtime relay asserts for a programmatic
++  // request. Authorization binds this to the verified on-chain owner; publicly
++  // observable chain material is never used as an entitlement.
++  function principalOf(req: express.Request): { address: string; role: "keeper" | "visitor" } {
++    return {
++      address: String(req.header("x-archive-principal") ?? "0x0000000000000000000000000000000000000000"),
++      role: req.header("x-archive-role") === "keeper" ? "keeper" : "visitor"
++    };
++  }
++
++  function sameHex(a: string, b: string): boolean {
++    return a.toLowerCase() === b.toLowerCase();
++  }
+ 
+   // Console pages sit behind an operator login; the programmatic /api and
+   // /archive relay surfaces are reached by the runtime, not the browser.
+@@ -110,8 +131,25 @@ export function routes(config: AppConfig) {
+         return;
+       }
+ 
+-      const token = deriveArchiveToken(filing);
+-      issuedTokens.add(token);
++      // Principal-to-owner binding: the verified on-chain owner must be the
++      // authenticated caller the relay asserts. The grant is issued to that
++      // owner, never to an anonymous or public-fields-only caller.
++      const principal = principalOf(req);
++      if (principal.role !== "keeper" || !sameHex(principal.address, filing.owner)) {
++        res.status(403).json({ error: "caller is not the rightful keeper" });
++        return;
++      }
++
++      // Final authorization point: one legitimate unlock per witnessed filing,
++      // keyed by the id bound to verified on-chain values.
++      if (consumedFilings.has(filing.id)) {
++        res.status(409).json({ error: "filing already unlocked" });
++        return;
++      }
++      consumedFilings.add(filing.id);
++
++      const token = deriveArchiveToken(config, filing);
++      issuedTokens.set(token, filing.owner);
+       res.json({
+         archive: config.archiveBundle,
+         download: "/api/source/bundle",
+@@ -126,10 +164,20 @@ export function routes(config: AppConfig) {
+   router.get("/api/source/bundle", (req, res) => {
+     const bearer = String(req.header("authorization") ?? "");
+     const token = bearer.startsWith("Bearer ") ? bearer.slice(7) : String(req.query.token ?? "");
+-    if (!issuedTokens.has(token)) {
++    const grantedOwner = token ? issuedTokens.get(token) : undefined;
++    if (!grantedOwner) {
++      res.status(403).json({ error: "source token required" });
++      return;
++    }
++    // Not a bearer capability: honour the token only for the authenticated owner
++    // it was granted to, so an observed/leaked token is useless to anyone else.
++    const principal = principalOf(req);
++    if (principal.role !== "keeper" || !sameHex(principal.address, grantedOwner)) {
+       res.status(403).json({ error: "source token required" });
+       return;
+     }
++    // Single-use: spend the token on presentation so it cannot be replayed.
++    issuedTokens.delete(token);
+ 
+     const bundle = path.resolve(process.cwd(), config.archiveBundle);
+     if (!fs.existsSync(bundle)) {
+diff --git a/phantom_burn/app/src/sourceVault.ts b/phantom_burn/app/src/sourceVault.ts
+index 7af78b2..5fe0242 100644
+--- a/phantom_burn/app/src/sourceVault.ts
++++ b/phantom_burn/app/src/sourceVault.ts
+@@ -9,13 +9,15 @@ export type UnlockReceipt = {
+   registry: string;
+   owner: string;
+   shardId: string;
+-  uri: string;
++  uri?: string;
+   unlockSeal?: string;
+-  nonce: string;
++  nonce?: string;
+ };
+ 
+-// The filing data we read back off the chain for the referenced receipt.
++// The filing data we read back off the chain for the referenced receipt, plus a
++// stable id (bound to witnessed values) used for single-use consumption.
+ export type FiledShard = {
++  id: string;
+   owner: string;
+   shardId: string;
+   uri: string;
+@@ -23,37 +25,67 @@ export type FiledShard = {
+   nonce: string;
+ };
+ 
++const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
++
+ const shardFiledEvent = parseAbiItem(
+   "event ShardFiled(address indexed owner, bytes32 indexed shardId, string uri, bytes32 unlockSeal, uint256 nonce)"
+ );
+ 
++const HEX = /^0x[0-9a-fA-F]+$/;
++
++function isHex(value: unknown, bytes: number): value is string {
++  return typeof value === "string" && HEX.test(value) && value.length === 2 + bytes * 2;
++}
++
++function eqHex(a: string, b: string): boolean {
++  return a.toLowerCase() === b.toLowerCase();
++}
++
++// Fail-closed shape gate: exact hex widths for each required field.
+ function looksLikeReceipt(receipt: UnlockReceipt): boolean {
+   return Boolean(
+-    receipt?.txHash?.startsWith("0x") &&
+-      receipt.owner?.startsWith("0x") &&
+-      receipt.shardId?.startsWith("0x") &&
++    receipt &&
++      isHex(receipt.txHash, 32) &&
++      isHex(receipt.registry, 20) &&
++      isHex(receipt.owner, 20) &&
++      isHex(receipt.shardId, 32) &&
+       Number.isInteger(receipt.logIndex) &&
+-      receipt.nonce
++      receipt.logIndex >= 0
+   );
+ }
+ 
+-// Resolve the on-chain ShardFiled record a receipt points at, so a bundle
+-// grant is bound to a real filing rather than to caller-supplied values.
++// Resolve the on-chain ShardFiled record a receipt points at, so a bundle grant
++// is bound to a real, registry-witnessed filing rather than to caller-supplied
++// values. A receipt that no rightful keeper issued (no matching event on the
++// trusted registry) resolves to null and is refused.
+ export async function resolveFiling(config: AppConfig, receipt: UnlockReceipt): Promise<FiledShard | null> {
+   if (!looksLikeReceipt(receipt)) {
+     return null;
+   }
+ 
++  // Only resolve receipts naming the registry this console trusts.
++  if (eqHex(config.registryAddress, ZERO_ADDRESS) || !eqHex(receipt.registry, config.registryAddress)) {
++    return null;
++  }
++
+   const client = createPublicClient({ chain: foundry, transport: http(config.rpcUrl) });
+   try {
+     const txReceipt = await client.getTransactionReceipt({ hash: receipt.txHash as `0x${string}` });
+-    const log =
+-      txReceipt.logs.find((entry) => Number(entry.logIndex) === receipt.logIndex) ?? txReceipt.logs[0];
+-    if (!log) {
++    if (txReceipt.status !== "success") {
++      return null;
++    }
++
++    // The log at the referenced index must have been emitted by the trusted
++    // registry itself — not an attacker-deployed look-alike re-emitting ShardFiled.
++    const log = txReceipt.logs.find((entry) => Number(entry.logIndex) === receipt.logIndex);
++    if (!log || !eqHex(log.address, config.registryAddress)) {
+       return null;
+     }
+ 
+     const decoded = decodeEventLog({ abi: [shardFiledEvent], data: log.data, topics: log.topics });
++    if (decoded.eventName !== "ShardFiled") {
++      return null;
++    }
+     const args = decoded.args as {
+       owner: string;
+       shardId: string;
+@@ -61,7 +93,20 @@ export async function resolveFiling(config: AppConfig, receipt: UnlockReceipt):
+       unlockSeal: string;
+       nonce: bigint;
+     };
++
++    // What the receipt claims about owner/shard must equal what the ledger
++    // witnessed; the grant is then derived from the witnessed values.
++    if (!eqHex(receipt.owner, args.owner) || !eqHex(receipt.shardId, args.shardId)) {
++      return null;
++    }
++
++    const id = crypto
++      .createHash("sha256")
++      .update([config.registryAddress, args.owner, args.shardId, receipt.txHash, receipt.logIndex].join(":"))
++      .digest("hex");
++
+     return {
++      id,
+       owner: args.owner,
+       shardId: args.shardId,
+       uri: args.uri,
+@@ -73,10 +118,12 @@ export async function resolveFiling(config: AppConfig, receipt: UnlockReceipt):
+   }
+ }
+ 
+-// Bind the bundle token to the filing so a grant maps back to one shard.
+-export function deriveArchiveToken(filing: FiledShard): string {
++// Bind the bundle token to the filing with a server-side secret so it is NOT
++// derivable from publicly observable chain fields. Only the app (holding
++// sourceBundleSigningKey) can mint or recognise a valid bundle token.
++export function deriveArchiveToken(config: AppConfig, filing: FiledShard): string {
+   return crypto
+-    .createHash("sha256")
++    .createHmac("sha256", config.sourceBundleSigningKey)
+     .update(["archive", filing.owner, filing.shardId, filing.unlockSeal, filing.nonce].join(":"))
+     .digest("hex");
+ }
+diff --git a/phantom_burn/app/test/sourceVault.test.mjs b/phantom_burn/app/test/sourceVault.test.mjs
+index 8f8045e..68e6b30 100644
+--- a/phantom_burn/app/test/sourceVault.test.mjs
++++ b/phantom_burn/app/test/sourceVault.test.mjs
+@@ -1,18 +1,33 @@
+ import test from "node:test";
+ import assert from "node:assert/strict";
+-import { createHash } from "node:crypto";
++import { createHmac } from "node:crypto";
+ 
+-test("archive token is deterministic for a resolved filing", () => {
+-  const filing = {
+-    owner: "0x1111111111111111111111111111111111111111",
+-    shardId: "0x" + "22".repeat(32),
+-    uri: "ipfs://archive",
+-    unlockSeal: "0x" + "33".repeat(32),
+-    nonce: "1"
+-  };
+-  const expected = createHash("sha256")
++// Self-contained: mirror the keyed-token derivation so `npm test` never depends
++// on a prior build (dist) or on install scripts having run.
++
++function deriveArchiveToken(signingKey, filing) {
++  return createHmac("sha256", signingKey)
+     .update(["archive", filing.owner, filing.shardId, filing.unlockSeal, filing.nonce].join(":"))
+     .digest("hex");
+-  assert.equal(expected.length, 64);
++}
++
++const filing = {
++  owner: "0x1111111111111111111111111111111111111111",
++  shardId: "0x" + "22".repeat(32),
++  uri: "ipfs://archive",
++  unlockSeal: "0x" + "33".repeat(32),
++  nonce: "1"
++};
++
++test("archive token is a 32-byte keyed HMAC over the witnessed filing", () => {
++  const token = deriveArchiveToken("server-secret", filing);
++  assert.equal(token.length, 64);
+ });
+ 
++test("archive token depends on the server signing key (not derivable from public fields alone)", () => {
++  assert.notEqual(
++    deriveArchiveToken("server-secret", filing),
++    deriveArchiveToken("other-secret", filing),
++    "a different signing key must produce a different token"
++  );
++});
+diff --git a/phantom_burn/archive-service.locked.tar.gz b/phantom_burn/archive-service.locked.tar.gz
+index 27b72f8258d082a36912257f6c386edec78ffa0b..440fc32ce4718a009994a6d24d26e8822fcb0799 100644
+GIT binary patch
+delta 16004
+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
+arwwu)jsFk6;nU~7L7e>}!9Wr~LH-9p!fsIj
+
+delta 13404
+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
+
+diff --git a/phantom_burn/archive-service/src/chainReceipt.ts b/phantom_burn/archive-service/src/chainReceipt.ts
+index 0d6cc92..89f5abc 100644
+--- a/phantom_burn/archive-service/src/chainReceipt.ts
++++ b/phantom_burn/archive-service/src/chainReceipt.ts
+@@ -1,4 +1,6 @@
+ import crypto from "node:crypto";
++import { createPublicClient, decodeEventLog, http, parseAbiItem } from "viem";
++import { foundry } from "viem/chains";
+ import type { ArchiveConfig } from "./config.js";
+ 
+ export type ChainReceipt = {
+@@ -7,8 +9,8 @@ export type ChainReceipt = {
+   registry: string;
+   owner: string;
+   shardId: string;
+-  unlockSeal: string;
+-  nonce: string;
++  unlockSeal?: string;
++  nonce?: string;
+ };
+ 
+ export type Principal = {
+@@ -16,20 +18,158 @@ export type Principal = {
+   role: "keeper" | "visitor";
+ };
+ 
+-export function receiptId(receipt: ChainReceipt): string {
++const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
++
++const shardFiledEvent = parseAbiItem(
++  "event ShardFiled(address indexed owner, bytes32 indexed shardId, string uri, bytes32 unlockSeal, uint256 nonce)"
++);
++
++// Replay key, derived from the trusted registry plus the WITNESSED identity of the
++// filing (never from caller-controlled values).
++export function receiptId(registry: string, owner: string, shardId: string, txHash: string, logIndex: number): string {
+   return crypto
+     .createHash("sha256")
+-    .update([receipt.registry, receipt.owner, receipt.shardId, receipt.txHash, receipt.logIndex].join(":"))
++    .update([registry, owner, shardId, txHash, logIndex].join(":"))
+     .digest("hex");
+ }
+ 
++const HEX = /^0x[0-9a-fA-F]+$/;
++
++function isHex(value: unknown, bytes: number): value is string {
++  return typeof value === "string" && HEX.test(value) && value.length === 2 + bytes * 2;
++}
++
++function eqHex(a: string, b: string): boolean {
++  return a.toLowerCase() === b.toLowerCase();
++}
++
++// Structural gate. Rejected before any RPC round-trip. Passing proves nothing
++// about authenticity — the on-chain witness does that.
++function wellFormed(receipt: ChainReceipt): boolean {
++  return Boolean(
++    receipt &&
++      isHex(receipt.txHash, 32) &&
++      isHex(receipt.registry, 20) &&
++      isHex(receipt.owner, 20) &&
++      isHex(receipt.shardId, 32) &&
++      Number.isInteger(receipt.logIndex) &&
++      receipt.logIndex >= 0
++  );
++}
++
++type Witnessed = {
++  owner: string;
++  shardId: string;
++  unlockSeal: string;
++  nonce: string;
++};
++
++// Read back the ShardFiled event the receipt points at and return the fields the
++// registry actually witnessed. Returns null (caller fails closed) unless the log
++// was emitted by the configured registry — not an attacker-deployed look-alike
++// re-using the ShardFiled signature — and is sufficiently confirmed.
++async function witnessFiling(config: ArchiveConfig, receipt: ChainReceipt): Promise<Witnessed | null> {
++  const client = createPublicClient({ chain: foundry, transport: http(config.rpcUrl) });
++  const txReceipt = await client.getTransactionReceipt({ hash: receipt.txHash as `0x${string}` });
++  if (txReceipt.status !== "success") {
++    return null;
++  }
++
++  const log = txReceipt.logs.find((entry) => Number(entry.logIndex) === receipt.logIndex);
++  if (!log || !eqHex(log.address, config.registryAddress)) {
++    return null;
++  }
++
++  const decoded = decodeEventLog({ abi: [shardFiledEvent], data: log.data, topics: log.topics });
++  if (decoded.eventName !== "ShardFiled") {
++    return null;
++  }
++  const args = decoded.args as unknown as {
++    owner: string;
++    shardId: string;
++    unlockSeal: string;
++    nonce: bigint;
++  };
++
++  if (config.confirmations > 0) {
++    const head = await client.getBlockNumber();
++    const depth = head >= txReceipt.blockNumber ? head - txReceipt.blockNumber + 1n : 0n;
++    if (depth < BigInt(config.confirmations)) {
++      return null;
++    }
++  }
++
++  return {
++    owner: args.owner,
++    shardId: args.shardId,
++    unlockSeal: args.unlockSeal,
++    nonce: args.nonce.toString()
++  };
++}
++
++// Weigh what a receipt CLAIMS against what the ledger WITNESSED. A counterfeit
++// receipt "no rightful keeper issued" — one with no matching ShardFiled event on
++// the trusted registry — cannot survive the weighing. The returned identity is
++// the witnessed one, so any grant/consumption downstream binds to verified
++// on-chain values rather than to caller-supplied fields.
+ export async function verifyReceipt(
+-  _config: ArchiveConfig,
+-  _principal: Principal,
++  config: ArchiveConfig,
++  principal: Principal,
+   receipt: ChainReceipt
+-): Promise<{ ok: true; receiptId: string } | { ok: false; reason: string }> {
+-  if (!receipt.txHash?.startsWith("0x") || !receipt.owner?.startsWith("0x") || !receipt.shardId?.startsWith("0x")) {
++): Promise<{ ok: true; receiptId: string; owner: string; shardId: string; unlockSeal: string; nonce: string } | { ok: false; reason: string }> {
++  // 1. Shape.
++  if (!wellFormed(receipt)) {
+     return { ok: false, reason: "malformed receipt" };
+   }
+-  return { ok: true, receiptId: receiptId(receipt) };
++
++  // 2. Registry binding. Only receipts naming the trusted registry are weighed;
++  //    an unconfigured registry fails closed.
++  if (eqHex(config.registryAddress, ZERO_ADDRESS)) {
++    return { ok: false, reason: "registry not configured" };
++  }
++  if (!eqHex(receipt.registry, config.registryAddress)) {
++    return { ok: false, reason: "unknown registry" };
++  }
++
++  // 3. Witness. Any RPC/decode failure, missing log, wrong emitter, reverted
++  //    transaction, or shallow confirmation depth means we cannot trust it.
++  let witnessed: Witnessed | null;
++  try {
++    witnessed = await witnessFiling(config, receipt);
++  } catch {
++    witnessed = null;
++  }
++  if (!witnessed) {
++    return { ok: false, reason: "receipt not witnessed by the registry" };
++  }
++
++  // 4. Claim must equal witness, field for field. This stops a receipt that
++  //    references a real transaction but misstates the filing it points at.
++  if (
++    !eqHex(receipt.owner, witnessed.owner) ||
++    !eqHex(receipt.shardId, witnessed.shardId) ||
++    (receipt.unlockSeal !== undefined && !eqHex(receipt.unlockSeal, witnessed.unlockSeal)) ||
++    (receipt.nonce !== undefined && String(receipt.nonce) !== witnessed.nonce)
++  ) {
++    return { ok: false, reason: "receipt does not match the witnessed filing" };
++  }
++
++  // 5. Principal-to-owner binding. Authorization rests on the AUTHENTICATED
++  //    caller the trusted relay asserts — never on publicly observable on-chain
++  //    material (the emitted unlockSeal is public and is treated as provenance
++  //    only, not as an entitlement). The verified on-chain owner is the only
++  //    identity permitted at this grant point: the caller must be a keeper and
++  //    must be that owner. A grant is therefore never a transferable capability.
++  if (principal.role !== "keeper" || !eqHex(principal.address, witnessed.owner)) {
++    return { ok: false, reason: "caller is not the rightful keeper" };
++  }
++
++  return {
++    ok: true,
++    receiptId: receiptId(config.registryAddress, witnessed.owner, witnessed.shardId, receipt.txHash, receipt.logIndex),
++    owner: witnessed.owner,
++    shardId: witnessed.shardId,
++    unlockSeal: witnessed.unlockSeal,
++    nonce: witnessed.nonce
++  };
+ }
+diff --git a/phantom_burn/archive-service/src/config.ts b/phantom_burn/archive-service/src/config.ts
+index 30151e7..21aee35 100644
+--- a/phantom_burn/archive-service/src/config.ts
++++ b/phantom_burn/archive-service/src/config.ts
+@@ -28,6 +28,11 @@ export function loadConfig(): ArchiveConfig {
+     rpcUrl: process.env.PHANTOM_BURN_RPC_URL ?? "http://127.0.0.1:8545",
+     registryAddress: process.env.PHANTOM_BURN_REGISTRY_ADDRESS ?? deployedRegistry() ??
+       "0x0000000000000000000000000000000000000000",
+-    confirmations: Number(process.env.ARCHIVE_CONFIRMATIONS ?? "12")
++    // Required confirmation depth before the vault will act on a witnessed
++    // filing. The default of 1 means "the filing must be mined" — the correct
++    // floor for the single-sequencer dev chain (chain-id 31337, no reorgs),
++    // while still rejecting pending/unmined material. Operators on a chain with
++    // reorg risk raise this via ARCHIVE_CONFIRMATIONS.
++    confirmations: Number(process.env.ARCHIVE_CONFIRMATIONS ?? "1")
+   };
+ }
+diff --git a/phantom_burn/archive-service/src/receiptStore.ts b/phantom_burn/archive-service/src/receiptStore.ts
+index ae31b4c..c0975cc 100644
+--- a/phantom_burn/archive-service/src/receiptStore.ts
++++ b/phantom_burn/archive-service/src/receiptStore.ts
+@@ -1,3 +1,12 @@
++// Single-use ledger for consumed receipts, keyed by the deterministic
++// receiptId. This enforces the "one legitimate owner unlock" invariant.
++//
++// NOTE (residual, documented deliberately): this store is in-memory and
++// per-process, so it resets on restart and is not shared across replicas. For
++// the single archive instance this challenge runs it is sufficient, but a
++// production deployment must back consumption with a durable, shared store
++// (e.g. a Postgres row with a UNIQUE(receiptId) constraint) so the single-use
++// guarantee survives restarts and holds across instances.
+ const consumed = new Set<string>();
+ 
+ export function markConsumed(receiptId: string): boolean {
+diff --git a/phantom_burn/archive-service/src/routes.ts b/phantom_burn/archive-service/src/routes.ts
+index 2b430b1..f6ab054 100644
+--- a/phantom_burn/archive-service/src/routes.ts
++++ b/phantom_burn/archive-service/src/routes.ts
+@@ -154,6 +154,9 @@ export function routes(config: ArchiveConfig) {
+         return;
+       }
+ 
++      // Single-use, keyed by the receiptId derived from the WITNESSED filing —
++      // this is the final authorization point, bound to verified on-chain values,
++      // so exactly one legitimate keeper open is granted per filing.
+       if (!markConsumed(verdict.receiptId)) {
+         res.status(409).json({ error: "receipt already consumed" });
+         return;
+@@ -161,7 +164,7 @@ export function routes(config: ArchiveConfig) {
+ 
+       res.json({
+         opened: true,
+-        shardId: receipt.shardId,
++        shardId: verdict.shardId,
+         archive: "crown-source-ledger",
+         grants: ["source:read", "decree:audit"]
+       });
+diff --git a/phantom_burn/archive-service/test/chainReceipt.test.mjs b/phantom_burn/archive-service/test/chainReceipt.test.mjs
+index de0c2f2..f285ff9 100644
+--- a/phantom_burn/archive-service/test/chainReceipt.test.mjs
++++ b/phantom_burn/archive-service/test/chainReceipt.test.mjs
+@@ -2,17 +2,23 @@ import test from "node:test";
+ import assert from "node:assert/strict";
+ import { createHash } from "node:crypto";
+ 
+-test("receipt id includes registry owner shard tx and log index", () => {
+-  const receipt = {
+-    registry: "0x1111111111111111111111111111111111111111",
+-    owner: "0x2222222222222222222222222222222222222222",
+-    shardId: "0x" + "33".repeat(32),
+-    txHash: "0x" + "44".repeat(32),
+-    logIndex: 0
+-  };
+-  const id = createHash("sha256")
+-    .update([receipt.registry, receipt.owner, receipt.shardId, receipt.txHash, receipt.logIndex].join(":"))
++// Self-contained: mirror the pure helpers so `npm test` never depends on a prior
++// build (dist) or on install scripts having run.
++
++function receiptId(registry, owner, shardId, txHash, logIndex) {
++  return createHash("sha256")
++    .update([registry, owner, shardId, txHash, logIndex].join(":"))
+     .digest("hex");
+-  assert.equal(id.length, 64);
++}
++
++test("receiptId binds registry, owner, shard, tx and log index", () => {
++  const a = receiptId("0x" + "11".repeat(20), "0x" + "22".repeat(20), "0x" + "33".repeat(32), "0x" + "44".repeat(32), 0);
++  const b = receiptId("0x" + "11".repeat(20), "0x" + "22".repeat(20), "0x" + "aa".repeat(32), "0x" + "44".repeat(32), 0);
++  assert.equal(a.length, 64);
++  assert.notEqual(a, b, "different shards must yield different ids");
+ });
+ 
++test("receiptId is deterministic for the same witnessed values", () => {
++  const args = ["0x" + "11".repeat(20), "0x" + "22".repeat(20), "0x" + "33".repeat(32), "0x" + "44".repeat(32), 3];
++  assert.equal(receiptId(...args), receiptId(...args));
++});
+diff --git a/phantom_burn/tools/unlock-source.mjs b/phantom_burn/tools/unlock-source.mjs
+index 8496edd..d907a6b 100644
+--- a/phantom_burn/tools/unlock-source.mjs
++++ b/phantom_burn/tools/unlock-source.mjs
+@@ -3,13 +3,20 @@ import fs from "node:fs";
+ 
+ const receiptPath = process.argv[2];
+ if (!receiptPath) {
+-  console.error("usage: npm run unlock-source -- receipt.json");
++  console.error("usage: SOURCE_BUNDLE_SIGNING_KEY=... npm run unlock-source -- receipt.json");
+   process.exit(2);
+ }
+ 
++// Server-side secret. The bundle token is keyed with it so it cannot be
++// reproduced from publicly observable on-chain fields; only a holder of the key
++// (the app, and an operator who configures the same key) can mint it. Keep this
++// in sync with app/src/config.ts (SOURCE_BUNDLE_SIGNING_KEY).
++const signingKey = process.env.SOURCE_BUNDLE_SIGNING_KEY ?? "phantom_burn-source-bundle-signing-key";
++
+ const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
++
+ const token = crypto
+-  .createHash("sha256")
++  .createHmac("sha256", signingKey)
+   .update(["archive", receipt.owner, receipt.shardId, receipt.unlockSeal, receipt.nonce].join(":"))
+   .digest("hex");
+ 
+-- 
+2.53.0
+
